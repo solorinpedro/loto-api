@@ -6,10 +6,18 @@ import datetime
 import pytz
 
 app = Flask(__name__)
-CORS(app) # Permite que tu App Android se conecte sin bloqueos
+CORS(app)
 
-# --- BASE DE DATOS DE DEFINICIONES (Integrada para evitar errores de archivos) ---
-# Aquí definimos qué buscamos en la web y cómo lo pintamos en la App
+# --- CONFIGURACIÓN DE NAVEGADOR ---
+# Usamos headers que parecen un Chrome real de Windows
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+    'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
+    'Referer': 'https://www.google.com/'
+}
+
+# --- CONFIGURACIÓN DE TUS LOTERÍAS ---
 LOTERIAS_CONFIG = [
     # LEIDSA
     {"id": "leidsa_pale", "nombre": "Quiniela Palé", "empresa": "Leidsa", "claves": ["Quiniela", "Palé"], "color": "#D32F2F", "cant": 3},
@@ -40,86 +48,130 @@ LOTERIAS_CONFIG = [
     {"id": "anguila_ma", "nombre": "Anguila (Mañana)", "empresa": "Anguila", "claves": ["Anguila", "Mañana"], "color": "#F57C00", "cant": 3},
 ]
 
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-}
-
-def scrapear_portada():
-    """Descarga la portada de loteriasdominicanas.com una sola vez"""
-    url = "https://loteriasdominicanas.com/"
-    datos_crudos = {}
+def obtener_fecha_rd():
     try:
-        response = requests.get(url, headers=HEADERS, timeout=10)
+        tz = pytz.timezone('America/Santo_Domingo')
+        return datetime.datetime.now(tz).strftime("%d/%m/%Y %I:%M %p")
+    except:
+        return datetime.datetime.now().strftime("%d/%m/%Y")
+
+# --- FUENTE A: LOTERIASDOMINICANAS.COM ---
+def scrape_source_a():
+    url = "https://loteriasdominicanas.com/"
+    datos = {}
+    print(f"Intentando Fuente A: {url}")
+    try:
+        session = requests.Session()
+        response = session.get(url, headers=HEADERS, timeout=5)
+        
         if response.status_code == 200:
             soup = BeautifulSoup(response.content, 'html.parser')
             bloques = soup.select(".game-block")
+            
             for block in bloques:
-                # Extraer Título
                 header = block.select_one(".header a")
-                if not header: continue
-                titulo = header.text.strip().lower()
-
-                # Extraer Bolas
-                bolas = [b.text.strip() for b in block.select(".score") if b.text.strip().isdigit()]
-                if bolas:
-                    datos_crudos[titulo] = bolas
+                if header:
+                    titulo = header.text.strip().lower()
+                    bolas = [b.text.strip() for b in block.select(".score") if b.text.strip().isdigit()]
+                    if bolas:
+                        datos[titulo] = bolas
     except Exception as e:
-        print(f"Error scraping: {e}")
-    return datos_crudos
+        print(f"Fallo Fuente A: {e}")
+    return datos
+
+# --- FUENTE B: CONECTATE.COM.DO (Respaldo) ---
+def scrape_source_b():
+    url = "https://www.conectate.com.do/loterias/"
+    datos = {}
+    print(f"Intentando Fuente B: {url}")
+    try:
+        session = requests.Session()
+        response = session.get(url, headers=HEADERS, timeout=6)
+        
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.content, 'html.parser')
+            # Conectate tiene una estructura diferente
+            # Buscamos los bloques de lotería
+            bloques = soup.select(".game-block") # A veces usan clases similares o divs contenedores
+            
+            # Si el selector anterior falla, intentamos una busqueda mas genérica en conectate
+            if not bloques:
+                bloques = soup.select(".content-loterias .bloque-loteria")
+
+            for block in bloques:
+                # Titulo en conectate suele ser h3 o a
+                titulo_el = block.select_one("a.title-loteria") or block.select_one("h3")
+                if titulo_el:
+                    titulo = titulo_el.text.strip().lower()
+                    
+                    # Bolas
+                    bolas = []
+                    spans = block.select(".bolo") # Conectate usa clase 'bolo'
+                    for span in spans:
+                        txt = span.text.strip()
+                        if txt.isdigit():
+                            bolas.append(txt)
+                    
+                    if bolas:
+                        datos[titulo] = bolas
+    except Exception as e:
+        print(f"Fallo Fuente B: {e}")
+    return datos
 
 @app.route('/', methods=['GET'])
 def home():
-    return jsonify({"status": "API Online", "rutas": "/api/loterias"})
+    return jsonify({"status": "Online"})
 
 @app.route('/api/loterias', methods=['GET'])
 def obtener_loterias():
-    # 1. Obtenemos todos los datos de la web
-    datos_web = scrapear_portada()
+    # 1. Intentamos Fuente A
+    datos_web = scrape_source_a()
+    fuente_usada = "Fuente A (LoteriasDominicanas)"
+
+    # 2. Si Fuente A vino vacía (posible bloqueo), activamos Fuente B
+    if not datos_web:
+        datos_web = scrape_source_b()
+        fuente_usada = "Fuente B (Conectate)"
+    
     resultados = []
 
-    # 2. Cruzamos los datos web con nuestra configuración
+    # 3. Procesamos los datos (sea cual sea la fuente que funcionó)
     for config in LOTERIAS_CONFIG:
         numeros_encontrados = []
         
-        # Buscamos coincidencias de palabras clave
         for titulo_web, bolas in datos_web.items():
-            # Si TODAS las palabras clave (ej: "Loto", "Pool") están en el título web
+            # Coincidencia difusa: Si las claves están en el título
             if all(clave.lower() in titulo_web for clave in config["claves"]):
                 numeros_encontrados = bolas
                 break
         
-        # 3. Formateo y Relleno
+        # Relleno y seguridad
         cant = config["cant"]
         if not numeros_encontrados:
             numeros_encontrados = ["--"] * cant
-        else:
-            # Recortar si sobran
-            if len(numeros_encontrados) > cant:
-                numeros_encontrados = numeros_encontrados[:cant]
-            # Rellenar si faltan
-            while len(numeros_encontrados) < cant:
-                numeros_encontrados.append("--")
+        
+        if len(numeros_encontrados) > cant:
+            numeros_encontrados = numeros_encontrados[:cant]
+        while len(numeros_encontrados) < cant:
+            numeros_encontrados.append("--")
 
         resultados.append({
             "id": config["id"],
             "nombre": config["nombre"],
-            "tanda": config["empresa"], # Usamos esto como subtitulo
+            "tanda": config["empresa"],
             "numeros": numeros_encontrados,
             "color": config["color"]
         })
 
-    # Fecha actual en RD
-    tz = pytz.timezone('America/Santo_Domingo')
-    fecha_hoy = datetime.datetime.now(tz).strftime("%d/%m/%Y %I:%M %p")
-
     return jsonify({
         "meta": {
-            "fecha_actualizacion": fecha_hoy,
-            "autor": "AbueloLoto API"
+            "fecha_actualizacion": obtener_fecha_rd(),
+            "autor": "AbueloLoto API",
+            "debug_fuente": fuente_usada, # Para saber cuál funcionó
+            "debug_items_encontrados": len(datos_web)
         },
         "loterias": resultados
     })
 
-# Necesario para Vercel
 if __name__ == '__main__':
     app.run(debug=True)
